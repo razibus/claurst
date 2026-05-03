@@ -87,7 +87,7 @@ pub use computer_use::ComputerUseTool;
 pub use mcp_auth_tool::McpAuthTool;
 pub use repl_tool::ReplTool;
 pub use synthetic_output::SyntheticOutputTool;
-pub use team_tool::{TeamCreateTool, TeamDeleteTool, register_agent_runner, AgentRunFn};
+pub use team_tool::{TeamCreateTool, TeamDeleteTool, TeamListTool, register_agent_runner, AgentRunFn};
 pub use remote_trigger::RemoteTriggerTool;
 pub use monitor_tool::MonitorTool;
 
@@ -521,6 +521,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(ReplTool),
         Box::new(TeamCreateTool),
         Box::new(TeamDeleteTool),
+        Box::new(TeamListTool),
         Box::new(SyntheticOutputTool),
         Box::new(McpAuthTool),
         Box::new(RemoteTriggerTool),

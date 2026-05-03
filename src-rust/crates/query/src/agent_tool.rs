@@ -651,4 +651,7 @@ pub fn init_team_swarm_runner() {
     );
 
     claurst_tools::register_agent_runner(runner);
+
+    // Restore known teams from disk.
+    tokio::spawn(claurst_tools::team_tool::load_all_teams());
 }

@@ -99,8 +99,45 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use tokio_util::sync::CancellationToken;
 
-static ACTIVE_TEAMS: Lazy<DashMap<String, Vec<CancellationToken>>> =
+pub static ACTIVE_TEAMS: Lazy<DashMap<String, Vec<CancellationToken>>> =
     Lazy::new(DashMap::new);
+
+pub static TEAM_REGISTRY: Lazy<DashMap<String, TeamConfig>> =
+    Lazy::new(DashMap::new);
+
+/// Load all team configurations from disk into the global registry.
+/// Called at process startup.
+pub async fn load_all_teams() {
+    if let Some(base_dir) = teams_base_dir() {
+        load_teams_from_dir(&base_dir).await;
+    }
+}
+
+async fn load_teams_from_dir(base_dir: &std::path::Path) {
+    if !base_dir.exists() {
+        return;
+    }
+
+    let mut entries = match tokio::fs::read_dir(base_dir).await {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.is_dir() {
+            let config_path = path.join("config.json");
+            if config_path.exists() {
+                if let Ok(content) = tokio::fs::read_to_string(&config_path).await {
+                    if let Ok(config) = serde_json::from_str::<TeamConfig>(&content) {
+                        let safe_name = sanitize_name(&config.name);
+                        TEAM_REGISTRY.insert(safe_name, config);
+                    }
+                }
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -139,26 +176,26 @@ fn now_millis() -> u64 {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct TeamMember {
-    agent_id: String,
-    name: String,
-    role: String,
-    joined_at: u64,
+pub struct TeamMember {
+    pub agent_id: String,
+    pub name: String,
+    pub role: String,
+    pub joined_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<String>>,
+    pub tools: Option<Vec<String>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct TeamConfig {
-    name: String,
-    task: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamConfig {
+    pub name: String,
+    pub task: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    created_at: u64,
-    lead_agent_id: String,
-    lead_session_id: String,
-    parallel: bool,
-    members: Vec<TeamMember>,
+    pub description: Option<String>,
+    pub created_at: u64,
+    pub lead_agent_id: String,
+    pub lead_session_id: String,
+    pub parallel: bool,
+    pub members: Vec<TeamMember>,
 }
 
 // ---------------------------------------------------------------------------
@@ -340,6 +377,9 @@ impl Tool for TeamCreateTool {
         if let Err(e) = tokio::fs::write(&config_path, &config_json).await {
             return ToolResult::error(format!("Failed to write config.json: {}", e));
         }
+
+        // Update the in-memory registry.
+        TEAM_REGISTRY.insert(final_name.clone(), config.clone());
 
         // Write empty results placeholder.
         let results_path = final_dir.join("results.json");
@@ -540,6 +580,9 @@ impl Tool for TeamDeleteTool {
             0
         };
 
+        // Remove from the in-memory registry.
+        TEAM_REGISTRY.remove(&safe_name);
+
         // Remove the team directory from disk.
         let dir = match team_dir(&params.team_name) {
             Some(d) => d,
@@ -584,5 +627,136 @@ impl Tool for TeamDeleteTool {
             })
             .to_string(),
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TeamListTool
+// ---------------------------------------------------------------------------
+
+pub struct TeamListTool;
+
+
+
+#[async_trait]
+impl Tool for TeamListTool {
+    fn name(&self) -> &str {
+        "TeamList"
+    }
+
+    fn description(&self) -> &str {
+        "List all known managed teams, including their status, members, and created time."
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::ReadOnly
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+
+    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+        let mut teams = Vec::new();
+        for entry in TEAM_REGISTRY.iter() {
+            let (name, config) = entry.pair();
+            let is_active = ACTIVE_TEAMS.contains_key(name);
+            teams.push(json!({
+                "name": config.name,
+                "task": config.task,
+                "description": config.description,
+                "created_at": config.created_at,
+                "active": is_active,
+                "member_count": config.members.len(),
+            }));
+        }
+
+        // Sort by created_at descending.
+        teams.sort_by(|a, b| {
+            b["created_at"]
+                .as_u64()
+                .unwrap_or(0)
+                .cmp(&a["created_at"].as_u64().unwrap_or(0))
+        });
+
+        ToolResult::success(json!({ "teams": teams }).to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn mock_member(name: &str) -> TeamMember {
+        TeamMember {
+            agent_id: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            role: "worker".to_string(),
+            joined_at: now_millis(),
+            tools: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_team_config_serialization() {
+        let config = TeamConfig {
+            name: "test-team".to_string(),
+            task: "test task".to_string(),
+            description: Some("desc".to_string()),
+            created_at: now_millis(),
+            lead_agent_id: "lead".to_string(),
+            lead_session_id: "session".to_string(),
+            parallel: true,
+            members: vec![mock_member("agent1")],
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let decoded: TeamConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.name, "test-team");
+        assert_eq!(decoded.members.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_load_teams_from_dir() {
+        let tmp = tempdir().unwrap();
+        let team_path = tmp.path().join("my-team");
+        tokio::fs::create_dir_all(&team_path).await.unwrap();
+
+        let config = TeamConfig {
+            name: "My Team".to_string(),
+            task: "do things".to_string(),
+            description: None,
+            created_at: now_millis(),
+            lead_agent_id: "l".to_string(),
+            lead_session_id: "s".to_string(),
+            parallel: true,
+            members: vec![],
+        };
+
+        let config_json = serde_json::to_string(&config).unwrap();
+        tokio::fs::write(team_path.join("config.json"), config_json).await.unwrap();
+
+        // Clear registry and load
+        TEAM_REGISTRY.clear();
+        load_teams_from_dir(tmp.path()).await;
+
+        assert!(TEAM_REGISTRY.contains_key("My-Team"));
+        let loaded = TEAM_REGISTRY.get("My-Team").unwrap();
+        assert_eq!(loaded.task, "do things");
+    }
+
+    #[tokio::test]
+    async fn test_sanitize_name() {
+        assert_eq!(sanitize_name("My Team"), "My-Team");
+        assert_eq!(sanitize_name("Team@123"), "Team-123");
+        assert_eq!(sanitize_name("safe_name"), "safe_name");
     }
 }

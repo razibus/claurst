@@ -48,7 +48,7 @@ pub struct AgentsCommand;
 impl NamedCommand for AgentsCommand {
     fn name(&self) -> &str { "agents" }
     fn description(&self) -> &str { "Manage and configure sub-agents" }
-    fn usage(&self) -> &str { "claude agents [list|create|edit|delete] [name]" }
+    fn usage(&self) -> &str { "claude agents [list|activity|create|edit|delete] [name]" }
 
     fn execute_named(&self, args: &[&str], ctx: &CommandContext) -> CommandResult {
         match args.first().copied().unwrap_or("list") {
@@ -82,6 +82,63 @@ impl NamedCommand for AgentsCommand {
                     }
                 }
                 out.push_str("\nUse 'claude agents create <name>' to add a new agent.");
+                CommandResult::Message(out)
+            }
+            "activity" | "teams" => {
+                use claurst_tools::team_tool::{ACTIVE_TEAMS, TEAM_REGISTRY};
+                use chrono::{DateTime, Utc};
+
+                if TEAM_REGISTRY.is_empty() {
+                    return CommandResult::Message(
+                        "No managed agent teams found.\n\n\
+                         You can create one by telling an agent to \"Create a team named <name> to <task>\"."
+                            .to_string(),
+                    );
+                }
+
+                let mut out = "Agent Teams Activity:\n\n".to_string();
+                let mut teams: Vec<_> = TEAM_REGISTRY.iter().collect();
+
+                // Sort by created_at descending.
+                teams.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+                for entry in teams {
+                    let name = entry.key();
+                    let config = entry.value();
+                    let is_running = ACTIVE_TEAMS.contains_key(name);
+
+                    // Format creation time
+                    let started_at = DateTime::<Utc>::from_timestamp((config.created_at / 1000) as i64, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "unknown time".to_string());
+
+                    let status = if is_running {
+                        "\u{25b6} ACTIVE"
+                    } else {
+                        "\u{23f8} STOPPED"
+                    };
+
+                    out.push_str(&format!(
+                        "{} Team: {} [{}]\n",
+                        if is_running { "●" } else { "○" },
+                        config.name,
+                        status
+                    ));
+                    if is_running {
+                        out.push_str(&format!("    Started: {}\n", started_at));
+                    }
+                    out.push_str(&format!("    Task:    {}\n", config.task));
+                    out.push_str(&format!(
+                        "    Status:  {} agents currently assigned\n",
+                        config.members.len()
+                    ));
+                    if let Some(ref desc) = config.description {
+                        out.push_str(&format!("    Details: {}\n", desc));
+                    }
+                    out.push_str("\n");
+                }
+
+                out.push_str("Use /agents list to see all available agent blueprints.");
                 CommandResult::Message(out)
             }
             "create" => {
