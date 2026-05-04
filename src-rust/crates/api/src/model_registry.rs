@@ -71,6 +71,86 @@ impl ModelRegistry {
         registry
     }
 
+    /// Create a new registry populated from the provided configuration.
+    pub fn from_config(config: &claurst_core::config::Config) -> Self {
+        let mut registry = Self::new();
+
+        // 1. Add whitelisted models first to ensure they are in the registry
+        //    before we apply filters.
+        for (provider_id, provider_cfg) in &config.provider_configs {
+            if !provider_cfg.enabled {
+                continue;
+            }
+
+            let pid = ProviderId::new(provider_id.as_str());
+
+            for model_id in &provider_cfg.models_whitelist {
+                let key = format!("{}/{}", pid, model_id);
+                if !registry.entries.contains_key(&key) {
+                    registry.insert(ModelEntry {
+                        info: ModelInfo {
+                            id: ModelId::new(model_id.as_str()),
+                            provider_id: pid.clone(),
+                            name: model_id.clone(),
+                            context_window: 128_000,
+                            max_output_tokens: 8_192,
+                        },
+                        cost_input: None,
+                        cost_output: None,
+                        cost_cache_read: None,
+                        cost_cache_write: None,
+                        tool_calling: true,
+                        reasoning: false,
+                        vision: false,
+                        family: None,
+                        status: "active".to_string(),
+                    });
+                }
+            }
+        }
+
+        // 2. Apply filters (whitelist/blacklist)
+        registry.apply_config_filters(config);
+
+        registry
+    }
+
+    /// Apply whitelist and blacklist filters from the configuration.
+    ///
+    /// This should be called after populating the registry (from bundled snapshot,
+    /// config, or disk cache) to ensure only allowed models are available.
+    pub fn apply_config_filters(&mut self, config: &claurst_core::config::Config) {
+        for (provider_id, provider_cfg) in &config.provider_configs {
+            let pid_str = provider_id.to_string();
+
+            if !provider_cfg.enabled {
+                // If a provider is disabled, remove all its models.
+                self.entries.retain(|_, entry| &*entry.info.provider_id != pid_str);
+                continue;
+            }
+
+            // Apply whitelist: if not empty, keep only whitelisted models for this provider.
+            if !provider_cfg.models_whitelist.is_empty() {
+                self.entries.retain(|_, entry| {
+                    if &*entry.info.provider_id != pid_str {
+                        return true;
+                    }
+                    provider_cfg.models_whitelist.contains(&entry.info.id.to_string())
+                });
+            }
+
+            // Apply blacklist: remove blacklisted models for this provider.
+            if !provider_cfg.models_blacklist.is_empty() {
+                self.entries.retain(|_, entry| {
+                    if &*entry.info.provider_id != pid_str {
+                        return true;
+                    }
+                    !provider_cfg.models_blacklist.contains(&entry.info.id.to_string())
+                });
+            }
+        }
+    }
+
     /// Configure a cache file path for persistence between sessions.
     pub fn with_cache_path(mut self, path: PathBuf) -> Self {
         self.cache_path = Some(path);
@@ -653,8 +733,84 @@ pub fn effective_model_for_config(
         if let Some(best) = registry.best_model_for_provider(provider_id) {
             return best;
         }
+        // Fallback: pick the first available model for the provider if any.
+        if let Some(entry) = registry.list_by_provider(provider_id).first() {
+            return entry.info.id.to_string();
+        }
     }
 
     // Fall back to the hardcoded table.
     config.effective_model().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claurst_core::config::{Config, ProviderConfig};
+
+    #[test]
+    fn test_apply_config_filters_blacklist() {
+        let mut registry = ModelRegistry::new();
+        let pid = "test-provider";
+        let mid = "test-model";
+        
+        registry.insert(ModelEntry {
+            info: ModelInfo {
+                id: ModelId::new(mid),
+                provider_id: ProviderId::new(pid),
+                name: "Test Model".to_string(),
+                context_window: 1000,
+                max_output_tokens: 100,
+            },
+            cost_input: None,
+            cost_output: None,
+            cost_cache_read: None,
+            cost_cache_write: None,
+            tool_calling: false,
+            reasoning: false,
+            vision: false,
+            family: None,
+            status: "active".to_string(),
+        });
+
+        let mut config = Config::default();
+        let mut pcfg = ProviderConfig::default();
+        pcfg.models_blacklist = vec![mid.to_string()];
+        config.provider_configs.insert(pid.to_string(), pcfg);
+
+        registry.apply_config_filters(&config);
+
+        assert!(registry.get(pid, mid).is_none(), "Blacklisted model should be removed");
+    }
+
+    #[test]
+    fn test_apply_config_filters_whitelist() {
+        let mut registry = ModelRegistry::new();
+        let pid = "test-provider";
+        
+        // Add two models
+        for mid in ["model-a", "model-b"] {
+            registry.insert(ModelEntry {
+                info: ModelInfo {
+                    id: ModelId::new(mid),
+                    provider_id: ProviderId::new(pid),
+                    name: mid.to_string(),
+                    context_window: 1000,
+                    max_output_tokens: 100,
+                },
+                cost_input: None, cost_output: None, cost_cache_read: None, cost_cache_write: None,
+                tool_calling: false, reasoning: false, vision: false, family: None, status: "active".to_string(),
+            });
+        }
+
+        let mut config = Config::default();
+        let mut pcfg = ProviderConfig::default();
+        pcfg.models_whitelist = vec!["model-a".to_string()];
+        config.provider_configs.insert(pid.to_string(), pcfg);
+
+        registry.apply_config_filters(&config);
+
+        assert!(registry.get(pid, "model-a").is_some(), "Whitelisted model should be kept");
+        assert!(registry.get(pid, "model-b").is_none(), "Non-whitelisted model should be removed");
+    }
 }

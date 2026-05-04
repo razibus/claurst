@@ -236,8 +236,8 @@ fn import_config_picker_items() -> Vec<SelectItem> {
     ]
 }
 
-fn provider_picker_items() -> Vec<SelectItem> {
-    vec![
+fn provider_picker_items(config: &claurst_core::config::Config) -> Vec<SelectItem> {
+    let mut items = vec![
         SelectItem { id: "openai".into(), title: "OpenAI".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "openai-codex".into(), title: "OpenAI Codex".into(), description: "(ChatGPT Plus/Pro — browser login)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "github-copilot".into(), title: "GitHub Copilot".into(), description: "(GitHub subscription or token)".into(), category: "Popular".into(), badge: None },
@@ -286,7 +286,33 @@ fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "upstage".into(), title: "Upstage".into(), description: "Hosted Upstage models".into(), category: "Other".into(), badge: None },
         SelectItem { id: "stepfun".into(), title: "StepFun".into(), description: "Hosted reasoning models".into(), category: "Other".into(), badge: None },
         SelectItem { id: "fireworks".into(), title: "Fireworks AI".into(), description: "Fast inference".into(), category: "Other".into(), badge: None },
-    ]
+    ];
+
+    // Mark configured providers.
+    for item in items.iter_mut() {
+        if let Some(pcfg) = config.provider_configs.get(&item.id) {
+            if pcfg.enabled {
+                item.badge = Some("CONNECTED".to_string());
+            }
+        }
+    }
+
+    // Add any providers from config that aren't in the hardcoded list.
+    let known_ids: std::collections::HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
+    for (id, pcfg) in &config.provider_configs {
+        if !pcfg.enabled { continue; }
+        if !known_ids.contains(id.as_str()) {
+            items.push(SelectItem {
+                id: id.clone(),
+                title: id.clone(),
+                description: "Custom provider from settings.json".into(),
+                category: "Custom".into(),
+                badge: Some("CONNECTED".to_string()),
+            });
+        }
+    }
+
+    items
 }
 
 // ---------------------------------------------------------------------------
@@ -1140,6 +1166,19 @@ impl App {
         let config = config;
         let model_name = config.effective_model().to_string();
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
+        let provider_items = provider_picker_items(&config);
+        let model_registry = {
+            let mut reg = claurst_api::ModelRegistry::from_config(&config);
+            // Try to load cached models.dev data from disk.
+            let cache_path = dirs::cache_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("claurst")
+                .join("models.json");
+            reg.load_cache(&cache_path);
+            reg.apply_config_filters(&config);
+            reg
+        };
+
         Self {
             config,
             cost_tracker,
@@ -1246,21 +1285,12 @@ impl App {
             device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
             device_auth_pending: None,
             provider_registry: None,
-            model_registry: {
-                let mut reg = claurst_api::ModelRegistry::new();
-                // Try to load cached models.dev data from disk.
-                let cache_path = dirs::cache_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join("claurst")
-                    .join("models.json");
-                reg.load_cache(&cache_path);
-                reg
-            },
+            model_registry,
             model_picker_fetch_pending: false,
             session_list_pending: false,
             session_list_rx: None,
             auth_store: claurst_core::AuthStore::load(),
-            connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
+            connect_dialog: DialogSelectState::new("Connect a provider", provider_items),
             import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
             import_config_dialog: ImportConfigDialogState::new(),
             command_palette: {
@@ -1838,9 +1868,9 @@ impl App {
         self.close_secondary_views();
         self.config = config;
         self.provider_registry = provider_registry;
-        self.model_registry = claurst_api::ModelRegistry::new();
+        self.model_registry = claurst_api::ModelRegistry::from_config(&self.config);
         self.auth_store = auth_store;
-        self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items());
+        self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items(&self.config));
         self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());
         self.import_config_dialog = ImportConfigDialogState::new();
         self.model_picker = ModelPickerState::new();

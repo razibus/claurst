@@ -575,6 +575,7 @@ pub mod config {
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use tracing::warn;
 
     // ---- Hook configuration ----------------------------------------------
 
@@ -1380,7 +1381,14 @@ pub mod config {
             let path = Self::global_settings_path();
             if path.exists() {
                 let content = tokio::fs::read_to_string(&path).await?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
+                let stripped = strip_jsonc_comments(&content);
+                match serde_json::from_str::<Self>(&stripped) {
+                    Ok(s) => Ok(s),
+                    Err(e) => {
+                        warn!("Failed to parse global settings.json: {}", e);
+                        Ok(Self::default())
+                    }
+                }
             } else {
                 Ok(Self::default())
             }
@@ -1402,7 +1410,14 @@ pub mod config {
             let path = Self::global_settings_path();
             if path.exists() {
                 let content = std::fs::read_to_string(&path)?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
+                let stripped = strip_jsonc_comments(&content);
+                match serde_json::from_str::<Self>(&stripped) {
+                    Ok(s) => Ok(s),
+                    Err(e) => {
+                        warn!("Failed to parse global settings.json: {}", e);
+                        Ok(Self::default())
+                    }
+                }
             } else {
                 Ok(Self::default())
             }
@@ -4242,5 +4257,44 @@ mod tests {
             assert!(preset.executor_model.contains('/'),
                 "Preset {} executor_model must be provider/model", preset.name);
         }
+    }
+
+    #[test]
+    fn test_strip_jsonc_comments() {
+        let jsonc = r#"
+        {
+            // line comment
+            "key": "value", /* block
+            comment */
+            "key2": "value2" // trailing
+        }
+        "#;
+        let stripped = strip_jsonc_comments(jsonc);
+        assert!(!stripped.contains("//"));
+        assert!(!stripped.contains("/*"));
+        assert!(!stripped.contains("*/"));
+        
+        let parsed: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(parsed["key"], "value");
+        assert_eq!(parsed["key2"], "value2");
+    }
+
+    #[test]
+    fn test_settings_parsing_with_comments() {
+        let jsonc = r#"
+        {
+            /* Agents configuration */
+            "agents": {
+                "tester": {
+                    "description": "Test agent",
+                    "access": "full"
+                }
+            }
+        }
+        "#;
+        let stripped = strip_jsonc_comments(jsonc);
+        let settings: crate::config::Settings = serde_json::from_str(&stripped).expect("Should parse Settings with comments");
+        assert!(settings.agents.contains_key("tester"));
+        assert_eq!(settings.agents["tester"].description, Some("Test agent".to_string()));
     }
 }

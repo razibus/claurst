@@ -2094,21 +2094,19 @@ impl SlashCommand for DoctorCommand {
         // Settings validation — try loading ~/.claurst/settings.json
         let settings_path = config_dir.join("settings.json");
         if settings_path.exists() {
-            match std::fs::read_to_string(&settings_path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<claurst_core::config::Settings>(&s).ok())
+            let content = std::fs::read_to_string(&settings_path).unwrap_or_default();
+            let stripped = claurst_core::config::strip_jsonc_comments(&content);
+            match serde_json::from_str::<claurst_core::config::Settings>(&stripped)
             {
-                Some(_) => lines.push("  ✓ settings.json valid".to_string()),
-                None => {
-                    // Try as raw JSON to distinguish missing vs invalid
-                    match std::fs::read_to_string(&settings_path)
-                        .ok()
-                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                Ok(_) => lines.push("  ✓ settings.json valid".to_string()),
+                Err(_) => {
+                    // Try as raw JSON (after stripping) to distinguish structure vs syntax
+                    match serde_json::from_str::<serde_json::Value>(&stripped)
                     {
-                        Some(_) => lines.push(
+                        Ok(_) => lines.push(
                             "  ⚠ settings.json is JSON but has unexpected structure".to_string()
                         ),
-                        None => lines.push(
+                        Err(_) => lines.push(
                             "  ✗ settings.json is invalid JSON — run /config to repair".to_string()
                         ),
                     }
@@ -7585,9 +7583,18 @@ impl SlashCommand for ProvidersCommand {
         "Usage: /providers\n\nList all providers registered in the model registry with their\nmodel counts, context windows, and pricing information."
     }
 
-    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let registry = claurst_api::ModelRegistry::new();
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let registry = claurst_api::ModelRegistry::from_config(&ctx.config);
         let all = registry.list_all();
+
+        let args = args.trim().to_lowercase();
+        let show_all = args == "all" || ctx.config.provider.is_none();
+
+        let target_provider = if show_all {
+            None
+        } else {
+            ctx.config.provider.as_ref()
+        };
 
         if all.is_empty() {
             return CommandResult::Message("No providers available.".to_string());
@@ -7597,22 +7604,47 @@ impl SlashCommand for ProvidersCommand {
         use std::collections::HashMap;
         let mut by_provider: HashMap<String, Vec<_>> = HashMap::new();
         for entry in &all {
+            let pid = entry.info.provider_id.to_string();
+            if let Some(target) = target_provider {
+                if pid != *target {
+                    continue;
+                }
+            }
             by_provider
-                .entry(entry.info.provider_id.to_string())
+                .entry(pid)
                 .or_default()
                 .push(entry);
+        }
+
+        if by_provider.is_empty() && target_provider.is_some() {
+            return CommandResult::Message(format!(
+                "No models available for provider '{}'. (Try '/models all' to see all providers)",
+                target_provider.unwrap()
+            ));
         }
 
         // Sort providers alphabetically for stable output
         let mut provider_keys: Vec<String> = by_provider.keys().cloned().collect();
         provider_keys.sort();
 
-        let mut lines = vec!["Available providers:\n".to_string()];
+        let mut lines = if let Some(target) = target_provider {
+            vec![format!("Models for {}:\n", target.to_uppercase())]
+        } else {
+            vec!["Available providers:\n".to_string()]
+        };
+
         for provider in &provider_keys {
             let models = &by_provider[provider];
-            lines.push(format!("\n{} ({} model{})", provider.to_uppercase(), models.len(),
-                if models.len() == 1 { "" } else { "s" }));
-            for m in models.iter().take(3) {
+            if target_provider.is_none() {
+                lines.push(format!("\n{} ({} model{})", provider.to_uppercase(), models.len(),
+                    if models.len() == 1 { "" } else { "s" }));
+            }
+
+            // If focused on one provider, show ALL its models.
+            // If showing all providers, show only top 3.
+            let limit = if target_provider.is_some() { models.len() } else { 3 };
+
+            for m in models.iter().take(limit) {
                 let cost_str = match (m.cost_input, m.cost_output) {
                     (Some(i), Some(o)) => format!("${:.2}/${:.2} per 1M", i, o),
                     _ => "free/local".to_string(),
@@ -7620,9 +7652,13 @@ impl SlashCommand for ProvidersCommand {
                 lines.push(format!("  {} — {}K ctx, {}",
                     m.info.id, m.info.context_window / 1000, cost_str));
             }
-            if models.len() > 3 {
-                lines.push(format!("  ... and {} more", models.len() - 3));
+            if models.len() > limit {
+                lines.push(format!("  ... and {} more", models.len() - limit));
             }
+        }
+
+        if target_provider.is_some() {
+            lines.push("\n(Type '/models all' to see other providers)".to_string());
         }
 
         CommandResult::Message(lines.join("\n"))

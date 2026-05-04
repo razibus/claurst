@@ -360,15 +360,54 @@ async fn main() -> anyhow::Result<()> {
 
     // Fast-path: `claude models` — list all available providers and models.
     if raw_args.get(1).map(|s| s.as_str()) == Some("models") {
-        let mut registry = claurst_api::ModelRegistry::new();
+        let settings = Settings::load().await.unwrap_or_default();
+        let config = settings.effective_config();
+        let mut registry = claurst_api::ModelRegistry::from_config(&config);
         // Load cached models.dev data if available so the list is comprehensive.
         registry.load_cache(&models_cache_path());
+        registry.apply_config_filters(&config);
+
+        // Determine target provider: optional arg after command or config's provider.
+        let mut target_provider: Option<&str> = None;
+        if raw_args.len() > 2 {
+            // Use the second argument as provider filter if it does not start with '-'.
+            let possible = raw_args[2].as_str();
+            if !possible.starts_with('-') {
+                target_provider = Some(possible);
+            }
+        }
+        if target_provider.is_none() {
+            target_provider = config.provider.as_deref();
+        }
+        let show_all = raw_args.iter().any(|arg| arg == "--all" || arg == "-a");
+        if show_all { target_provider = None; }
+
         let mut entries = registry.list_all();
+        if let Some(target) = target_provider {
+            entries.retain(|e| &*e.info.provider_id == target);
+        }
+
         // Sort by provider then model id for stable output.
         entries.sort_by(|a, b| {
             (&*a.info.provider_id).cmp(&*b.info.provider_id)
                 .then_with(|| (&*a.info.id).cmp(&*b.info.id))
         });
+
+        if entries.is_empty() {
+             if let Some(target) = target_provider {
+                 println!("No models available for provider '{}'. (Try 'claude models --all')", target);
+             } else {
+                 println!("No models available.");
+             }
+             return Ok(());
+        }
+
+        if let Some(target) = target_provider {
+            println!("Models for {}:", target.to_uppercase());
+        } else {
+            println!("Available providers and models:");
+        }
+
         for entry in entries {
             println!(
                 "{}/{} — {} (ctx: {}K, in: ${:.2}/M, out: ${:.2}/M)",
